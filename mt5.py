@@ -1,12 +1,12 @@
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Optional
 from flask import Flask, request, render_template_string, redirect, url_for, flash
 
 # ————————————————————————————————————————————
-# Use real MetaTrader5 API on Windows, otherwise fall back to stub
+# Use real MT5 on Windows, otherwise use stub
 # ————————————————————————————————————————————
 if sys.platform.startswith("win"):
     import MetaTrader5 as mt5
@@ -21,16 +21,16 @@ class LimitOrder:
     ticket: int
     symbol: str
     entry_price: float
-    direction: str       # 'LONG' or 'SHORT'
+    direction: str            # 'LONG' or 'SHORT'
     volume: float
-    sl: float            # stop-loss level
-    tp: float            # take-profit level
-    mode: str            # 'AUTOMATIC' or 'MANUAL'
-    adjust_wait: float = 0.0      # seconds (AUTO mode)
-    adjust_pct: float = 0.0       # percent (AUTO mode)
-    pip_distance: float = 0.0     # pips (MANUAL mode)
-    duplicate_ticket: Optional[int] = None
-    active: bool = True           # watcher flag
+    sl: float                 # stop-loss level
+    tp: float                 # take-profit level
+    mode: str                 # 'AUTOMATIC' or 'MANUAL'
+    adjust_wait: float = 0.0  # seconds before adjustment
+    adjust_pct: float = 0.0   # adjustment % in AUTO mode
+    pip_distance: float = 0.0 # pips in MANUAL mode
+    pending_ticket: Optional[int] = None  # ID of the duplicate pending order
+    active: bool = True       # watcher loop flag
 
 @dataclass
 class Settings:
@@ -40,7 +40,7 @@ class Settings:
     pip_distance: float = 20.0
     enable_market: bool = False
 
-# In-memory settings
+# Global & per-symbol settings
 per_pair_settings: Dict[str, Settings] = {}
 global_settings = Settings()
 bot: Optional['MT5TradingBot'] = None
@@ -59,79 +59,71 @@ class MT5TradingBot:
 
     def monitor(self):
         """
-        1) Poll pending limit orders → _add()
-        2) If enabled, poll live market positions → _add_position()
+        1) Poll for new pending LIMIT orders
+        2) If market-reentry enabled, poll live POSITIONS
         """
         while self.running:
-            # pending limit orders
+            # --- LIMIT orders ---
             for o in (mt5.orders_get() or []):
                 if o.type in (mt5.ORDER_TYPE_BUY_LIMIT, mt5.ORDER_TYPE_SELL_LIMIT):
                     with self.lock:
                         if o.ticket not in self.tracked:
                             print(f"[BOT] Detected new LIMIT order #{o.ticket}")
-                            self._add(o)
-            # market orders
+                            self._add(o, is_market=False)
+
+            # --- MARKET orders (already filled positions) ---
             if self.settings.enable_market:
                 for p in (mt5.positions_get() or []):
                     if p.ticket not in self.tracked:
                         print(f"[BOT] Detected new MARKET position #{p.ticket}")
-                        self._add_position(p)
+                        self._add(p, is_market=True)
+
             time.sleep(1)
 
-    def _add(self, o):
+    def _add(self, o, is_market: bool):
         """
-        Build a LimitOrder from a pending order and spawn its watcher.
+        Build a LimitOrder (from a pending order or live position)
+        and spawn its watcher thread.
         """
+        s = self.settings
+
+        # safe retrieval of entry price
+        entry = getattr(o, 'price_open', None)
+        if entry is None and hasattr(o, 'price'):
+            entry = o.price
+
         lo = LimitOrder(
             ticket      = o.ticket,
             symbol      = o.symbol,
-            entry_price = o.price_open,
-            direction   = 'LONG' if o.type == mt5.ORDER_TYPE_BUY_LIMIT else 'SHORT',
-            volume      = o.volume_initial,
+            entry_price = entry,
+            direction   = ('LONG' if (o.type == mt5.ORDER_TYPE_BUY_LIMIT or
+                                      (is_market and o.type == mt5.ORDER_TYPE_BUY))
+                           else 'SHORT'),
+            volume      = getattr(o, 'volume_initial', getattr(o, 'volume', 0.0)),
             sl          = o.sl,
             tp          = o.tp,
-            mode        = self.settings.mode,
-            adjust_wait = self.settings.adjust_wait,
-            adjust_pct  = self.settings.adjust_pct,
-            pip_distance= self.settings.pip_distance
+            mode        = s.mode,
+            adjust_wait = s.adjust_wait,
+            adjust_pct  = s.adjust_pct,
+            pip_distance= s.pip_distance
         )
         self.tracked[o.ticket] = lo
         threading.Thread(target=self._watch, args=(lo,), daemon=True).start()
 
-    def _add_position(self, p):
-        """
-        Build a LimitOrder from an already-filled market position.
-        """
-        lo = LimitOrder(
-            ticket      = p.ticket,
-            symbol      = p.symbol,
-            entry_price = p.price_open,
-            direction   = 'LONG' if p.type == mt5.ORDER_TYPE_BUY else 'SHORT',
-            volume      = p.volume,
-            sl          = p.sl,
-            tp          = p.tp,
-            mode        = self.settings.mode,
-            adjust_wait = self.settings.adjust_wait,
-            adjust_pct  = self.settings.adjust_pct,
-            pip_distance= self.settings.pip_distance
-        )
-        self.tracked[p.ticket] = lo
-        threading.Thread(target=self._watch, args=(lo,), daemon=True).start()
-
     def _watch(self, lo: LimitOrder):
         """
-        1) Wait for fill (limit) or existence (market)
-        2) Then watch until position disappears (SL/TP hit)
-        3) Trigger AUTO or MANUAL re-entry
+        1) For LIMIT orders: wait until the pending fills (position appears)
+           For MARKET orders: they already are positions.
+        2) Then watch until SL/TP hit (position disappears) → re-entry.
         """
-        # wait for the position to appear
+        # 1) wait for position
         while self.running:
             if mt5.positions_get(ticket=lo.ticket):
                 print(f"[BOT] Order {lo.ticket} filled at {lo.entry_price}")
                 break
             time.sleep(0.5)
 
-        # watch for SL/TP exit
+        # 2) watch for exit
         while lo.active and self.running:
             if not mt5.positions_get(ticket=lo.ticket):
                 print(f"[BOT] SL/TP hit for ticket {lo.ticket}")
@@ -145,12 +137,11 @@ class MT5TradingBot:
     def _auto(self, lo: LimitOrder):
         """
         AUTOMATIC:
-        a) Duplicate immediately with exact entry/SL/TP
-        b) Wait adjust_wait seconds
-        c) If price moves further losing-side beyond SL, modify in-place
+        a) duplicate at original entry → store pending_ticket
+        b) wait adjust_wait
+        c) if price moved further losing, order_modify that pending
         """
-        print(f"[BOT] AUTO re-entry for ticket {lo.ticket} @ {lo.entry_price}")
-        # a) duplicate
+        # a) initial duplicate
         req = {
             'action':    mt5.TRADE_ACTION_PENDING,
             'symbol':    lo.symbol,
@@ -165,50 +156,52 @@ class MT5TradingBot:
             'comment':   'AutoReEntryBot'
         }
         res = mt5.order_send(req)
-        lo.duplicate_ticket = res.order
-        print(f"[BOT] order_send() → {req}")
+        pending_id = getattr(res, 'order', None)
+        lo.pending_ticket = pending_id
+        print(f"[BOT] AUTO re-entry for ticket {lo.ticket} @ {lo.entry_price}")
 
         # b) wait
         time.sleep(lo.adjust_wait)
 
-        # c) conditional adjustment
+        # c) compute movement past SL
         tick = mt5.symbol_info_tick(lo.symbol)
-        movement = tick.last - lo.sl
-        if (lo.direction=='LONG' and movement<0) or (lo.direction=='SHORT' and movement>0):
-            adj = abs(movement) * lo.adjust_pct/100
-            new_entry = lo.entry_price - adj if lo.direction=='LONG' else lo.entry_price + adj
+        movement = (tick.last - lo.sl) if lo.direction=='LONG' else (lo.sl - tick.last)
+        if movement > 0:
+            adj = movement * lo.adjust_pct/100
+            if lo.direction=='LONG':
+                new_entry = lo.entry_price - adj
+            else:
+                new_entry = lo.entry_price + adj
             delta = new_entry - lo.entry_price
             lo.entry_price += delta
             lo.sl          += delta
             lo.tp          += delta
-            print(f"[BOT] AUTO placing adjusted @ {new_entry}")
+
+            # modify existing pending, don't place new
             mod_req = {
-                'action':    mt5.TRADE_ACTION_MODIFY,
-                'order':     lo.duplicate_ticket,
-                'price':     lo.entry_price,
-                'sl':        lo.sl,
-                'tp':        lo.tp,
+                'order': lo.pending_ticket,
+                'price': lo.entry_price,
+                'sl':    lo.sl,
+                'tp':    lo.tp,
                 'deviation': 10
             }
-            mt5.order_send(mod_req)
-            print(f"[BOT] order_modify() → {mod_req}")
+            mt5.order_modify(mod_req)
+            print(f"[BOT] AUTO placing adjusted @ {lo.entry_price}")
         else:
             print("[BOT] Price did not move further losing → no adjustment")
 
     def _manual(self, lo: LimitOrder):
         """
-        MANUAL:
-        1) Offset SL by pip_distance
-        2) Apply same offset to entry & TP
-        3) Duplicate
+        MANUAL: offset by fixed pip_distance from SL, then duplicate.
         """
-        print(f"[BOT] MANUAL re-entry for ticket {lo.ticket}")
         point = mt5.symbol_info(lo.symbol).point
-        multiplier = -1 if lo.direction=='LONG' else 1
-        delta = lo.pip_distance * point * multiplier
-        lo.entry_price = lo.sl + delta
-        lo.sl         += delta
-        lo.tp         += delta
+        mult  = -1 if lo.direction=='LONG' else 1
+        delta = lo.pip_distance * point * mult
+        new_entry = lo.sl + delta
+        lo.entry_price = new_entry
+        lo.sl += delta
+        lo.tp += delta
+
         req = {
             'action':    mt5.TRADE_ACTION_PENDING,
             'symbol':    lo.symbol,
@@ -223,12 +216,12 @@ class MT5TradingBot:
             'comment':   'AutoReEntryBot'
         }
         mt5.order_send(req)
-        print(f"[BOT] order_send() → {req}")
+        print(f"[BOT] MANUAL re-entry for ticket {lo.ticket} @ {lo.entry_price}")
 
     def stop(self):
-        """Gracefully stop and disconnect."""
         self.running = False
         mt5.shutdown()
+
 
 # ————————————————————————————————————————————
 # FLASK WEB UI
@@ -253,11 +246,12 @@ TEMPLATE = '''
   <label>Adjust %:</label>
   <input name="pct"  type="number" step="0.01" value="{{ settings.adjust_pct }}"><br><br>
 
-  <label>Pip Distance:</label>
+  <label>Pip Dist:</label>
   <input name="pip"  type="number" step="0.1"  value="{{ settings.pip_distance }}"><br><br>
 
   <label>
-    <input type="checkbox" name="enable_market" {% if settings.enable_market %}checked{% endif %}>
+    <input type="checkbox" name="enable_market"
+      {% if settings.enable_market %}checked{% endif %}>
     Enable Market-Order Re-Entry
   </label><br><br>
 
@@ -304,4 +298,5 @@ def stop():
     return redirect(url_for('index'))
 
 if __name__ == '__main__':
+    # Avoid macOS AirPlay port conflict
     app.run(debug=True, host='0.0.0.0', port=5001)
