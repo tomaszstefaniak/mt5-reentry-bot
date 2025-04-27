@@ -4,12 +4,12 @@ class DummyMT5:
     _orders_called = False
     _pos_called    = False
 
-    # MT5 constants (stub)
-    ORDER_TYPE_BUY          = 0    # market buy
-    ORDER_TYPE_SELL         = 1    # market sell
-    ORDER_TYPE_BUY_LIMIT    = 2
-    ORDER_TYPE_SELL_LIMIT   = 3
-    TRADE_ACTION_PENDING    = 4
+    # — MT5 trade-type constants (match real MetaTrader5 API) —
+    ORDER_TYPE_BUY         = 0    # market buy
+    ORDER_TYPE_SELL        = 1    # market sell
+    ORDER_TYPE_BUY_LIMIT   = 2
+    ORDER_TYPE_SELL_LIMIT  = 3
+    TRADE_ACTION_PENDING   = 4
 
     def initialize(self):
         return True
@@ -18,7 +18,10 @@ class DummyMT5:
         return 0
 
     def orders_get(self):
-        # Return one fake pending limit order on first call
+        """
+        First call: return one fake pending BUY_LIMIT.
+        Thereafter: none.
+        """
         if not DummyMT5._orders_called:
             DummyMT5._orders_called = True
             FakeOrder = type(
@@ -36,12 +39,22 @@ class DummyMT5:
         return []
 
     def positions_get(self, ticket=None):
-        # 1st call: simulate that the limit filled → return a dummy position
+        """
+        First call: simulate that the above limit filled (a live position).
+        Thereafter: simulate SL/TP hit (no open position).
+        """
         if not DummyMT5._pos_called:
             DummyMT5._pos_called = True
-            Pos = type("P", (), {"ticket": ticket})
+            Pos = type("P", (), {
+                "ticket":     ticket,
+                "symbol":     "EURUSD",
+                "type":       DummyMT5.ORDER_TYPE_BUY,      # market buy
+                "price_open": 1.1000,
+                "volume":     0.1,
+                "sl":         1.0980,
+                "tp":         1.1020,
+            })
             return [Pos()]
-        # thereafter: simulate SL/TP hit → no open position
         return None
 
     def symbol_info_tick(self, symbol):
