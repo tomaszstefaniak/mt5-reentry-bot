@@ -43,7 +43,9 @@ class Settings:
     adjust_wait: float = 5.0      # seconds
     adjust_pct: float = 50.0      # percentage
     pip_distance: float = 20.0    # pips
+    enable_market: bool = False
 
+# Global & per-pair settings
 per_pair_settings: Dict[str, Settings] = {}
 global_settings = Settings()
 bot: Optional['MT5TradingBot'] = None
@@ -53,6 +55,7 @@ bot: Optional['MT5TradingBot'] = None
 # ————————————————————————————————————————————
 class MT5TradingBot:
     def __init__(self):
+        # initialize MT5 connection
         if not mt5.initialize():
             raise RuntimeError(f"MT5 init failed: {mt5.last_error()}")
         self.settings = global_settings
@@ -61,23 +64,31 @@ class MT5TradingBot:
         self.lock = threading.Lock()
 
     def monitor(self):
+        """
+        Poll for new orders every second and start a watcher thread for each.
+        """
         while self.running:
-            orders = mt5.orders_get()
-            for o in orders or []:
-                if o.type in (mt5.ORDER_TYPE_BUY_LIMIT, mt5.ORDER_TYPE_SELL_LIMIT):
+            orders = mt5.orders_get() or []
+            for o in orders:
+                is_limit = o.type in (mt5.ORDER_TYPE_BUY_LIMIT, mt5.ORDER_TYPE_SELL_LIMIT)
+                is_market = o.type in (mt5.ORDER_TYPE_BUY, mt5.ORDER_TYPE_SELL)
+                if is_limit or (is_market and self.settings.enable_market):
                     with self.lock:
                         if o.ticket not in self.tracked:
                             self._add(o)
             time.sleep(1)
 
     def _add(self, o):
+        """
+        Record order details and spawn a watcher thread.
+        """
         s = global_settings
         lo = LimitOrder(
             ticket=o.ticket,
             symbol=o.symbol,
-            entry_price=o.price_open,
-            direction='LONG' if o.type == mt5.ORDER_TYPE_BUY_LIMIT else 'SHORT',
-            volume=o.volume_initial,
+            entry_price=getattr(o, 'price_open', o.price),
+            direction='LONG' if o.type in (mt5.ORDER_TYPE_BUY_LIMIT, mt5.ORDER_TYPE_BUY) else 'SHORT',
+            volume=o.volume_initial if hasattr(o, 'volume_initial') else o.volume,
             sl=o.sl,
             tp=o.tp,
             mode=s.mode,
@@ -89,15 +100,18 @@ class MT5TradingBot:
         threading.Thread(target=self._watch, args=(lo,), daemon=True).start()
 
     def _watch(self, lo: LimitOrder):
-        # 1) Wait until the limit order actually fills
+        """
+        1) Wait for fill (pending -> position), then
+        2) watch until SL/TP exit, then re-enter.
+        """
+        # 1) Wait for fill
         while self.running:
-            all_orders = mt5.orders_get() or []
-            order = next((x for x in all_orders if x.ticket == lo.ticket), None)
-            if order and getattr(order, "state", None) == mt5.ORDER_STATE_FILLED:
+            pos = mt5.positions_get(ticket=lo.ticket)
+            if pos:
                 break
             time.sleep(0.5)
 
-        # 2) Now watch the live position for SL/TP exit
+        # 2) Watch for SL/TP exit
         while lo.active and self.running:
             pos = mt5.positions_get(ticket=lo.ticket)
             if not pos:
@@ -109,15 +123,15 @@ class MT5TradingBot:
             time.sleep(0.5)
 
     def _auto(self, lo: LimitOrder):
+        """
+        Automatic re-entry: duplicate immediately, wait, adjust by %.
+        """
         self._send(lo.entry_price, lo)
         time.sleep(lo.adjust_wait)
         tick = mt5.symbol_info_tick(lo.symbol)
         movement = tick.last - lo.sl
         adj = movement * lo.adjust_pct / 100
-        if lo.direction == 'LONG':
-            new_entry = lo.entry_price - adj
-        else:
-            new_entry = lo.entry_price + adj
+        new_entry = lo.entry_price - adj if lo.direction == 'LONG' else lo.entry_price + adj
         delta = new_entry - lo.entry_price
         lo.entry_price += delta
         lo.sl += delta
@@ -125,6 +139,9 @@ class MT5TradingBot:
         self._send(lo.entry_price, lo)
 
     def _manual(self, lo: LimitOrder):
+        """
+        Manual re-entry: fixed pip offset from SL.
+        """
         point = mt5.symbol_info(lo.symbol).point
         multiplier = -1 if lo.direction == 'LONG' else 1
         delta = lo.pip_distance * point * multiplier
@@ -135,25 +152,31 @@ class MT5TradingBot:
         self._send(lo.entry_price, lo)
 
     def _send(self, price: float, lo: LimitOrder):
-        request = {
-            'action': mt5.TRADE_ACTION_PENDING,
-            'symbol': lo.symbol,
-            'volume': lo.volume,
-            'type': mt5.ORDER_TYPE_BUY_LIMIT if lo.direction == 'LONG'
-                    else mt5.ORDER_TYPE_SELL_LIMIT,
-            'price': price,
-            'sl': lo.sl,
-            'tp': lo.tp,
+        """
+        Sends a pending limit order or market order request to MT5.
+        """
+        typ = (mt5.ORDER_TYPE_BUY_LIMIT if lo.direction=='LONG'
+               else mt5.ORDER_TYPE_SELL_LIMIT)
+        req = {
+            'action':    mt5.TRADE_ACTION_PENDING,
+            'symbol':    lo.symbol,
+            'volume':    lo.volume,
+            'type':      typ,
+            'price':     price,
+            'sl':        lo.sl,
+            'tp':        lo.tp,
             'deviation': 10,
-            'magic': 123456,
-            'comment': 'AutoReEntryBot'
+            'magic':     123456,
+            'comment':   'AutoReEntryBot'
         }
-        mt5.order_send(request)
+        mt5.order_send(req)
 
     def stop(self):
+        """
+        Gracefully stop monitoring and disconnect.
+        """
         self.running = False
         mt5.shutdown()
-
 
 # ————————————————————————————————————————————
 # FLASK WEB UI
@@ -171,9 +194,16 @@ TEMPLATE = '''
     <option value="AUTOMATIC" {{ 'selected' if settings.mode=='AUTOMATIC' else '' }}>Automatic</option>
     <option value="MANUAL"    {{ 'selected' if settings.mode=='MANUAL'    else '' }}>Manual</option>
   </select><br><br>
-  <label>Wait (s):</label><input name="wait" type="number" step="0.01" value="{{ settings.adjust_wait }}"><br><br>
-  <label>Adjust %:</label><input name="pct"  type="number" step="0.01" value="{{ settings.adjust_pct }}"><br><br>
-  <label>Pip Dist:</label><input name="pip"  type="number" step="0.1"  value="{{ settings.pip_distance }}"><br><br>
+  <label>Wait (s):</label>
+  <input name="wait" type="number" step="0.01" value="{{ settings.adjust_wait }}"><br><br>
+  <label>Adjust %:</label>
+  <input name="pct"  type="number" step="0.01" value="{{ settings.adjust_pct }}"><br><br>
+  <label>Pip Dist:</label>
+  <input name="pip"  type="number" step=“0.1” value="{{ settings.pip_distance }}"><br><br>
+  <label>
+    <input type="checkbox" name="enable_market" {{ 'checked' if settings.enable_market else '' }}>
+    Enable Market-Order Re-Entry
+  </label><br><br>
   <button type="submit">Start Bot</button>
 </form>
 <form method="post" action="{{ url_for('stop') }}" style="margin-top:10px;">
@@ -188,10 +218,11 @@ def index():
 @app.route('/start', methods=['POST'])
 def start():
     global bot
-    global_settings.mode         = request.form['mode']
-    global_settings.adjust_wait  = float(request.form['wait'])
-    global_settings.adjust_pct   = float(request.form['pct'])
-    global_settings.pip_distance = float(request.form['pip'])
+    global_settings.mode           = request.form['mode']
+    global_settings.adjust_wait    = float(request.form['wait'])
+    global_settings.adjust_pct     = float(request.form['pct'])
+    global_settings.pip_distance   = float(request.form['pip'])
+    global_settings.enable_market  = ('enable_market' in request.form)
     if bot:
         flash('Bot already running')
     else:
@@ -215,4 +246,5 @@ def stop():
     return redirect(url_for('index'))
 
 if __name__ == '__main__':
+    # run on port 5001
     app.run(debug=True, host='0.0.0.0', port=5001)

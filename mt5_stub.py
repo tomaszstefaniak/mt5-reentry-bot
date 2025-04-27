@@ -1,15 +1,15 @@
-# mt5_stub.py
-
 import time
 
 class DummyMT5:
-    _called = False
+    _orders_called = False
+    _pos_called    = False
 
-    # MT5 constants (stubbed)
-    ORDER_TYPE_BUY_LIMIT  = 0
-    ORDER_TYPE_SELL_LIMIT = 1
-    TRADE_ACTION_PENDING  = 1
-    ORDER_STATE_FILLED    = 4   # match real MT5 constant
+    # MT5 constants (stub)
+    ORDER_TYPE_BUY          = 0    # market buy
+    ORDER_TYPE_SELL         = 1    # market sell
+    ORDER_TYPE_BUY_LIMIT    = 2
+    ORDER_TYPE_SELL_LIMIT   = 3
+    TRADE_ACTION_PENDING    = 4
 
     def initialize(self):
         return True
@@ -18,39 +18,30 @@ class DummyMT5:
         return 0
 
     def orders_get(self):
-        # On first call, return one pending order object
-        if not DummyMT5._called:
-            DummyMT5._called = True
+        # Return one fake pending limit order on first call
+        if not DummyMT5._orders_called:
+            DummyMT5._orders_called = True
             FakeOrder = type(
                 "O", (), {
-                    "ticket": 12345,
-                    "symbol": "EURUSD",
-                    "type": DummyMT5.ORDER_TYPE_BUY_LIMIT,
-                    "price_open": 1.1000,
+                    "ticket":         12345,
+                    "symbol":         "EURUSD",
+                    "type":           DummyMT5.ORDER_TYPE_BUY_LIMIT,
+                    "price_open":     1.1000,
                     "volume_initial": 0.1,
-                    "sl": 1.0980,
-                    "tp": 1.1020,
-                    "state": None,   # pending
+                    "sl":             1.0980,
+                    "tp":             1.1020,
                 }
             )
             return [FakeOrder()]
-        # On subsequent calls, return it as "filled"
-        FilledOrder = type(
-            "O", (), {
-                "ticket": 12345,
-                "symbol": "EURUSD",
-                "type": DummyMT5.ORDER_TYPE_BUY_LIMIT,
-                "price_open": 1.1000,
-                "volume_initial": 0.1,
-                "sl": 1.0980,
-                "tp": 1.1020,
-                "state": DummyMT5.ORDER_STATE_FILLED,
-            }
-        )
-        return [FilledOrder()]
+        return []
 
     def positions_get(self, ticket=None):
-        # After "fill", simulate immediate SL hit by returning None
+        # 1st call: simulate that the limit filled → return a dummy position
+        if not DummyMT5._pos_called:
+            DummyMT5._pos_called = True
+            Pos = type("P", (), {"ticket": ticket})
+            return [Pos()]
+        # thereafter: simulate SL/TP hit → no open position
         return None
 
     def symbol_info_tick(self, symbol):
@@ -65,5 +56,5 @@ class DummyMT5:
     def shutdown(self):
         pass
 
-# Expose the stub as 'mt5'
+# expose stub as mt5
 mt5 = DummyMT5()
