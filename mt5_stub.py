@@ -1,13 +1,13 @@
-# mt5_stub.py
+import time
 
-# Stubbed MT5 API for macOS demos—including necessary constants
 class DummyMT5:
     _called = False
 
-    # MT5 constants
+    # MT5 constants (stub)
     ORDER_TYPE_BUY_LIMIT = 0
     ORDER_TYPE_SELL_LIMIT = 1
     TRADE_ACTION_PENDING = 1
+    ORDER_STATE_FILLED = 4    # mirror real MT5 constant
 
     def initialize(self):
         return True
@@ -16,7 +16,7 @@ class DummyMT5:
         return 0
 
     def orders_get(self):
-        # Return a single fake limit order on first call
+        # Return one fake pending order once
         if not DummyMT5._called:
             DummyMT5._called = True
             FakeOrder = type(
@@ -30,13 +30,20 @@ class DummyMT5:
                     "volume_initial": 0.1,
                     "sl": 1.0980,
                     "tp": 1.1020,
+                    "state": None,   # pending state
                 },
             )
             return [FakeOrder()]
         return []
 
+    def order_get(self, ticket):
+        # Simulate fill after a short delay
+        time.sleep(0.5)
+        # Return an object with .state == FILLED
+        return type("O", (), {"ticket": ticket, "state": DummyMT5.ORDER_STATE_FILLED})
+
     def positions_get(self, ticket=None):
-        # Always simulate SL hit
+        # Always simulate SL hit by returning None
         return None
 
     def symbol_info_tick(self, symbol):
@@ -51,5 +58,4 @@ class DummyMT5:
     def shutdown(self):
         pass
 
-# Expose stub as mt5
 mt5 = DummyMT5()
