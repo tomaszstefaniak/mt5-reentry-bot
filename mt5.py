@@ -6,7 +6,7 @@ from typing import Dict, Optional
 from flask import Flask, request, render_template_string, redirect, url_for, flash
 
 # ————————————————————————————————————————————
-# Use real MetaTrader5 API on Windows, otherwise fall back to our macOS stub
+# Use real MetaTrader5 API on Windows, otherwise fall back to macOS stub
 # ————————————————————————————————————————————
 if sys.platform.startswith("win"):
     import MetaTrader5 as mt5
@@ -91,8 +91,8 @@ class MT5TradingBot:
     def _watch(self, lo: LimitOrder):
         # 1) Wait until the limit order actually fills
         while self.running:
-            order = mt5.order_get(ticket=lo.ticket)
-            # If stub or real, order.state==FILLED signals execution
+            all_orders = mt5.orders_get() or []
+            order = next((x for x in all_orders if x.ticket == lo.ticket), None)
             if order and getattr(order, "state", None) == mt5.ORDER_STATE_FILLED:
                 break
             time.sleep(0.5)
@@ -169,11 +169,11 @@ TEMPLATE = '''
   <label>Mode:</label>
   <select name="mode">
     <option value="AUTOMATIC" {{ 'selected' if settings.mode=='AUTOMATIC' else '' }}>Automatic</option>
-    <option value="MANUAL" {{ 'selected' if settings.mode=='MANUAL' else '' }}>Manual</option>
+    <option value="MANUAL"    {{ 'selected' if settings.mode=='MANUAL'    else '' }}>Manual</option>
   </select><br><br>
   <label>Wait (s):</label><input name="wait" type="number" step="0.01" value="{{ settings.adjust_wait }}"><br><br>
-  <label>Adjust %:</label><input name="pct" type="number" step="0.01" value="{{ settings.adjust_pct }}"><br><br>
-  <label>Pip Distance:</label><input name="pip" type="number" step="0.1" value="{{ settings.pip_distance }}"><br><br>
+  <label>Adjust %:</label><input name="pct"  type="number" step="0.01" value="{{ settings.adjust_pct }}"><br><br>
+  <label>Pip Dist:</label><input name="pip"  type="number" step="0.1"  value="{{ settings.pip_distance }}"><br><br>
   <button type="submit">Start Bot</button>
 </form>
 <form method="post" action="{{ url_for('stop') }}" style="margin-top:10px;">
@@ -188,9 +188,9 @@ def index():
 @app.route('/start', methods=['POST'])
 def start():
     global bot
-    global_settings.mode = request.form['mode']
-    global_settings.adjust_wait = float(request.form['wait'])
-    global_settings.adjust_pct = float(request.form['pct'])
+    global_settings.mode         = request.form['mode']
+    global_settings.adjust_wait  = float(request.form['wait'])
+    global_settings.adjust_pct   = float(request.form['pct'])
     global_settings.pip_distance = float(request.form['pip'])
     if bot:
         flash('Bot already running')
@@ -215,4 +215,4 @@ def stop():
     return redirect(url_for('index'))
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0')
+    app.run(debug=True, host='0.0.0.0', port=5001)
