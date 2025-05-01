@@ -5,17 +5,17 @@ from dataclasses import dataclass
 from typing import Dict, Optional
 from flask import Flask, request, render_template_string, redirect, url_for, flash
 
-# ————————————————————————————————————————————
+# --------------------------------------------
 # Use real MetaTrader5 API on Windows, otherwise fall back to stub
-# ————————————————————————————————————————————
+# --------------------------------------------
 if sys.platform.startswith("win"):
     import MetaTrader5 as mt5
 else:
     from mt5_stub import mt5
 
-# ————————————————————————————————————————————
+# --------------------------------------------
 # DATA MODELS
-# ————————————————————————————————————————————
+# --------------------------------------------
 @dataclass
 class LimitOrder:
     ticket: int
@@ -30,6 +30,7 @@ class LimitOrder:
     adjust_pct: float = 0.0       # percent (AUTO mode)
     pip_distance: float = 0.0     # pips (MANUAL mode)
     active: bool = True           # watcher flag
+    is_market: bool = False       # determines if was originally a market position
 
 @dataclass
 class Settings:
@@ -39,16 +40,16 @@ class Settings:
     pip_distance: float = 20.0
     enable_market: bool = False
 
-# ————————————————————————————————————————————
+# --------------------------------------------
 # GLOBAL STATE
-# ————————————————————————————————————————————
+# --------------------------------------------
 per_pair_settings: Dict[str, Settings] = {}
 global_settings = Settings()
 bot: Optional['MT5TradingBot'] = None
 
-# ————————————————————————————————————————————
+# --------------------------------------------
 # BOT CORE
-# ————————————————————————————————————————————
+# --------------------------------------------
 class MT5TradingBot:
     def __init__(self):
         if not mt5.initialize():
@@ -95,7 +96,8 @@ class MT5TradingBot:
             mode        = s.mode,
             adjust_wait = s.adjust_wait,
             adjust_pct  = s.adjust_pct,
-            pip_distance= s.pip_distance
+            pip_distance= s.pip_distance,
+            is_market   = False   # This is a limit order
         )
         print(f"[BOT] Tracking LIMIT #{lo.ticket}: entry={lo.entry_price}, sl={lo.sl}, tp={lo.tp}")
         self.tracked[lo.ticket] = lo
@@ -115,7 +117,8 @@ class MT5TradingBot:
             mode        = s.mode,
             adjust_wait = s.adjust_wait,
             adjust_pct  = s.adjust_pct,
-            pip_distance= s.pip_distance
+            pip_distance= s.pip_distance,
+            is_market   = True    # Flag it as a market position
         )
         print(f"[BOT] Tracking MARKET #{lo.ticket}: entry={lo.entry_price}, sl={lo.sl}, tp={lo.tp}")
         self.tracked[p.ticket] = lo
@@ -147,7 +150,7 @@ class MT5TradingBot:
                 p = pos[0]
                 if (p.sl!=lo.sl) or (p.tp!=lo.tp):
                     lo.sl, lo.tp = p.sl, p.tp
-                    print(f"[BOT] UPDATED SL/TP on MARKET #{lo.ticket}: sl={lo.sl}, tp={lo.tp}")
+                    print(f"[BOT] UPDATED SL/TP on POSITION #{lo.ticket}: sl={lo.sl}, tp={lo.tp}")
                 break
             time.sleep(0.5)
 
@@ -181,40 +184,46 @@ class MT5TradingBot:
         3) If price moved further into loss, remove old + re-send at adjusted
         """
         print(f"[BOT] AUTO re-entry for ticket {lo.ticket} @ {lo.entry_price}")
-        lo.ticket = self._send(lo.entry_price, lo)
-
-        time.sleep(lo.adjust_wait)
-        tick     = mt5.symbol_info_tick(lo.symbol)
-        movement = tick.last - lo.sl
-        adj      = movement * lo.adjust_pct / 100
-        if lo.direction=='LONG':
-            new_entry = lo.entry_price - adj
+        
+        # For market positions, we need to send a market order directly, not a pending order
+        if lo.is_market:
+            lo.ticket = self._send_market(lo.entry_price, lo)
         else:
-            new_entry = lo.entry_price + adj
-
-        # only adjust if moved further against us
-        if (lo.direction=='LONG' and new_entry < lo.entry_price) or \
-           (lo.direction=='SHORT' and new_entry > lo.entry_price):
-
-            print(f"[BOT] AUTO adjusting existing pending @ {new_entry:.8f}")
-            # remove old pending
-            remove_req = {
-                'action': mt5.TRADE_ACTION_REMOVE,
-                'order':  lo.ticket,
-            }
-            res = mt5.order_send(remove_req)
-            print(f"[BOT] order_send(REMOVE) → retcode={res.retcode}")
-
-            # update our local levels
-            delta = new_entry - lo.entry_price
-            lo.entry_price += delta
-            lo.sl          += delta
-            lo.tp          += delta
-
-            # re-send the adjusted pending
             lo.ticket = self._send(lo.entry_price, lo)
-        else:
-            print("[BOT] Price did not move further losing → no adjustment")
+
+        if not lo.is_market:  # Only do the adjustment for pending limit orders
+            time.sleep(lo.adjust_wait)
+            tick     = mt5.symbol_info_tick(lo.symbol)
+            movement = tick.last - lo.sl
+            adj      = movement * lo.adjust_pct / 100
+            if lo.direction=='LONG':
+                new_entry = lo.entry_price - adj
+            else:
+                new_entry = lo.entry_price + adj
+
+            # only adjust if moved further against us
+            if (lo.direction=='LONG' and new_entry < lo.entry_price) or \
+               (lo.direction=='SHORT' and new_entry > lo.entry_price):
+
+                print(f"[BOT] AUTO adjusting existing pending @ {new_entry:.8f}")
+                # remove old pending
+                remove_req = {
+                    'action': mt5.TRADE_ACTION_REMOVE,
+                    'order':  lo.ticket,
+                }
+                res = mt5.order_send(remove_req)
+                print(f"[BOT] order_send(REMOVE) → retcode={res.retcode}")
+
+                # update our local levels
+                delta = new_entry - lo.entry_price
+                lo.entry_price += delta
+                lo.sl          += delta
+                lo.tp          += delta
+
+                # re-send the adjusted pending
+                lo.ticket = self._send(lo.entry_price, lo)
+            else:
+                print("[BOT] Price did not move further losing → no adjustment")
 
     def _manual(self, lo: LimitOrder):
         """
@@ -230,9 +239,14 @@ class MT5TradingBot:
         lo.entry_price = lo.sl + delta
         lo.sl         += delta
         lo.tp         += delta
-
+        
         print(f"[BOT] MANUAL placing @ {lo.entry_price:.8f}")
-        lo.ticket = self._send(lo.entry_price, lo)
+        
+        # For market positions, we need to send a market order directly
+        if lo.is_market:
+            lo.ticket = self._send_market(lo.entry_price, lo)
+        else:
+            lo.ticket = self._send(lo.entry_price, lo)
 
     def _send(self, price: float, lo: LimitOrder) -> int:
         """
@@ -255,14 +269,36 @@ class MT5TradingBot:
         print(f"[BOT] order_send() → {req}  retcode={result.retcode}, ticket={getattr(result,'order',None)}")
         return getattr(result, 'order', 0)
 
+    def _send_market(self, price: float, lo: LimitOrder) -> int:
+        """
+        Send a market order request. Returns the new ticket.
+        """
+        req = {
+            'action':    mt5.TRADE_ACTION_DEAL,  # Use DEAL for market orders
+            'symbol':    lo.symbol,
+            'volume':    lo.volume,
+            'type':      mt5.ORDER_TYPE_BUY if lo.direction=='LONG'
+                        else mt5.ORDER_TYPE_SELL,
+            'price':     mt5.symbol_info_tick(lo.symbol).ask if lo.direction=='LONG' 
+                        else mt5.symbol_info_tick(lo.symbol).bid,  # Use current price
+            'sl':        lo.sl,
+            'tp':        lo.tp,
+            'deviation': 10,
+            'magic':     123456,
+            'comment':   'AutoReEntryBot'
+        }
+        result = mt5.order_send(req)
+        print(f"[BOT] order_send(MARKET) → {req}  retcode={result.retcode}, ticket={getattr(result,'order',None)}")
+        return getattr(result, 'order', 0)
+
     def stop(self):
         self.running = False
         mt5.shutdown()
 
 
-# ————————————————————————————————————————————
+# --------------------------------------------
 # FLASK WEB UI
-# ————————————————————————————————————————————
+# --------------------------------------------
 app = Flask(__name__)
 app.secret_key = 'demo_secret'
 TEMPLATE = '''
